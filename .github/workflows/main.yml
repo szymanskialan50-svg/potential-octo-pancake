@@ -1,0 +1,133 @@
+name: Build iOS IPA
+
+# Builds an UNSIGNED MusicPlayer.ipa on a GitHub macOS runner.
+# Run it from the "Actions" tab -> "Build iOS IPA" -> "Run workflow".
+# Works in two layouts:
+#   1) full project in the repo (project.yml in the repo root), or
+#   2) phone-friendly: just upload MusicPlayer-iOS-Project.zip to the repo root
+#      next to this workflow file; the zip is unpacked automatically.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Locate project
+        id: locate
+        shell: bash
+        run: |
+          set -euo pipefail
+          yml="$(find . -name project.yml -not -path './_project/*' -not -path '*/__MACOSX/*' | head -n 1)"
+          if [ -n "$yml" ]; then
+            dir="$(dirname "$yml")"
+          else
+            zip="$(ls -1 *.zip 2>/dev/null | head -n 1 || true)"
+            if [ -z "$zip" ]; then
+              echo "::error::No project.yml and no .zip file found in the repository."
+              exit 1
+            fi
+            mkdir -p _project
+            unzip -q -o "$zip" -d _project
+            yml="$(find _project -name project.yml -not -path '*/__MACOSX/*' | head -n 1)"
+            dir="$(dirname "$yml")"
+          fi
+          echo "Project directory: $dir"
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+
+      - name: Select newest stable Xcode 26
+        shell: bash
+        run: |
+          set -euo pipefail
+          XC="$(ls -d /Applications/Xcode_26*.app 2>/dev/null | grep -E 'Xcode_26(\.[0-9]+){0,2}\.app$' | sort -V | tail -n 1 || true)"
+          if [ -n "$XC" ]; then
+            echo "Using $XC"
+            sudo xcode-select -s "$XC/Contents/Developer"
+          else
+            echo "No Xcode_26.x found, using the runner default"
+          fi
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Install XcodeGen
+        shell: bash
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        shell: bash
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: xcodegen generate
+
+      - name: Build (unsigned)
+        shell: bash
+        working-directory: ${{ steps.locate.outputs.dir }}
+        env:
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+        run: |
+          set -o pipefail
+          EXTRA=""
+          if [ -n "${YOUTUBE_API_KEY}" ]; then EXTRA="YOUTUBE_API_KEY=${YOUTUBE_API_KEY}"; fi
+          xcodebuild build \
+            -project Lumen.xcodeproj \
+            -scheme Lumen \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            $EXTRA \
+            2>&1 | tee xcodebuild.log | tail -n 150
+
+      - name: Package IPA
+        id: pack
+        shell: bash
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: |
+          set -euo pipefail
+          APP="build/Build/Products/Release-iphoneos/MusicPlayer.app"
+          test -d "$APP"
+          rm -rf Payload MusicPlayer.ipa
+          mkdir Payload
+          cp -R "$APP" Payload/
+          zip -qry MusicPlayer.ipa Payload
+          ls -lh MusicPlayer.ipa
+          echo "ipa=${{ steps.locate.outputs.dir }}/MusicPlayer.ipa" >> "$GITHUB_OUTPUT"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MusicPlayer-ipa
+          path: ${{ steps.pack.outputs.ipa }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish release with IPA (direct download link)
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "build-${{ github.run_number }}" "${{ steps.pack.outputs.ipa }}" \
+            --repo "${{ github.repository }}" \
+            --title "Music Player build ${{ github.run_number }}" \
+            --notes "Unsigned IPA. Sign and install it with Sideloadly, AltStore or your own signing tool."
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: ${{ steps.locate.outputs.dir }}/xcodebuild.log
+          if-no-files-found: ignore
